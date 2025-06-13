@@ -1,0 +1,20 @@
+{
+  "name": "ms-cors",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "bin": {
+    "ms-cors": "src/index.js"
+  },
+  "scripts": {
+    "dev": "node src/index.js"
+  },
+  "dependencies": {
+    "cors-anywhere": "^0.4.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.1",
+    "tsx": "^4.20.2",
+    "typescript": "^5.8.3"
+  }
+}
