@@ -10,7 +10,9 @@
     "dev": "node src/index.js"
   },
   "dependencies": {
-    "cors-anywhere": "^0.4.4"
+    "commander": "^14.0.0",
+    "express": "^5.1.0",
+    "http-proxy-middleware": "^3.0.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.1",
