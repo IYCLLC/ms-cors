@@ -19,11 +19,7 @@ program
     "allowed origin for CORS",
     "http://localhost:3000",
   )
-  .option(
-    "--fix-cookies",
-    "fix cookie domains for localhost development",
-    true,
-  )
+  .option("--fix-cookies", "fix cookie domains for localhost development", true)
   .option(
     "--cookie-domain <domain>",
     "domain to replace in cookies",
@@ -86,8 +82,6 @@ app.use("/", (req, res, next) => {
         proxyRes.headers["access-control-allow-credentials"] = "true";
         proxyRes.headers["access-control-allow-methods"] =
           "GET, POST, PUT, DELETE, OPTIONS";
-        proxyRes.headers["access-control-allow-headers"] =
-          "Content-Type, Authorization, X-Requested-With";
 
         // Fix cookie domain for localhost development
         if (fixCookies && proxyRes.headers["set-cookie"]) {
@@ -100,7 +94,7 @@ app.use("/", (req, res, next) => {
         }
       },
       error: (err, req, res) => {
-        console.error("Proxy error:", err.message);
+        console.error("Proxy error:", err);
         res.status(500).json({ error: "Proxy error: " + err.message });
       },
     },
@@ -111,5 +105,5 @@ app.use("/", (req, res, next) => {
 
 app.listen(port, host, () => {
   console.log(`Proxy server running on http://${host}:${port}`);
-  console.log("Usage: http://localhost:8080/http://target-host/path");
+  console.log(`Usage: http://${host}:${port}/http://target-host/path`);
 });
