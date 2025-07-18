@@ -81,7 +81,7 @@ app.use("/", (req, res, next) => {
         proxyRes.headers["access-control-allow-origin"] = allowedOrigin;
         proxyRes.headers["access-control-allow-credentials"] = "true";
         proxyRes.headers["access-control-allow-methods"] =
-          "GET, POST, PUT, DELETE, OPTIONS";
+          "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 
         // Fix cookie domain for localhost development
         if (fixCookies && proxyRes.headers["set-cookie"]) {
