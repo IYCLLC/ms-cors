@@ -4,6 +4,7 @@ const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const { Command } = require("commander");
 const http = require("http");
+const WebSocket = require("ws");
 
 const program = new Command();
 
@@ -100,44 +101,208 @@ const dynamicProxy = (req, res, next) => {
   proxy(req, res, next);
 };
 
-const targetOrigin = "https://ws-dev.messagespring.com/";
-const WS_PATH = "/api/chat/socket.io";
-
-const wsProxy = createProxyMiddleware({
-  target: targetOrigin,
-  changeOrigin: true,
-  ws: true,
-  secure: true,
-  logLevel: "debug",
-
-  pathRewrite: (rawPath, req) => {
-
-    let path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
-    // Remove proxy prefix (e.g. /https://ws-dev.messagespring.com)
-    path = path.replace(/^\/https?:\/\/[^/]+/, "");
-
-    // Normalize: make sure all WS routes end up under /api/chat/socket.io
-    if (path.startsWith(WS_PATH)) return path;
-    return path.replace(/^\/socket\.io/, WS_PATH);
-  },
-
-  // Helpful logs during WS upgrade
-  onProxyReqWs: (proxyReq, req, socket, options, head) => {
-    // @ts-ignore
-    const finalPath = proxyReq.path || req.url;
-    console.log(`➡️  WS → ${targetOrigin}${finalPath}`);
-  },
+// Middleware to parse cors-anywhere style URLs for Socket.IO
+app.use((req, res, next) => {
+  const match = req.url.match(/^\/(https?:\/\/[^\/]+)(\/socket\.io.*)?$/);
+  if (match) {
+    req.targetOrigin = match[1];
+    req.url = match[2] || "/socket.io";
+    console.log(`📍 Parsed target: ${req.targetOrigin}, path: ${req.url}`);
+  }
+  next();
 });
 
-app.use(["/socket.io", "/api/chat/socket.io"], wsProxy);
+// Dynamic WebSocket proxy
+app.use((req, res, next) => {
+  if (!req.targetOrigin) return next();
 
-app.use("/", dynamicProxy);
+  const proxy = createProxyMiddleware({
+    target: req.targetOrigin,
+    changeOrigin: true,
+    ws: true,
+    secure: false,
+    logLevel: "silent",
+
+    on: {
+      proxyReq: (proxyReq, req, res) => {
+        console.log(`➡️  HTTP → ${req.targetOrigin}${proxyReq.path}`);
+        proxyReq.removeHeader("origin");
+      },
+      proxyReqWs: (proxyReq, req, socket) => {
+        console.log(`➡️  WS → ${req.targetOrigin}${proxyReq.path}`);
+        proxyReq.removeHeader("origin");
+        proxyReq.removeHeader("referer");
+
+        // Intercept WebSocket frames to rewrite Socket.IO namespaces
+        const originalWrite = socket.write.bind(socket);
+        socket.write = function (data) {
+          if (typeof data === "string") {
+            // Rewrite namespace in Socket.IO CONNECT packets (e.g., "40/namespace,")
+            const namespacePattern = /^(4\d)(\/https?:\/\/[^,]+)(,.*)?$/;
+            if (namespacePattern.test(data)) {
+              data = data.replace(namespacePattern, "$1/$3");
+              console.log(`🔧 Rewrote client→server packet: stripped namespace`);
+            }
+          }
+          return originalWrite(data);
+        };
+      },
+      proxyRes: (proxyRes, req, res) => {
+        proxyRes.headers["access-control-allow-origin"] = allowedOrigin;
+        proxyRes.headers["access-control-allow-credentials"] = "true";
+
+        // Intercept server responses to add namespace back
+        const originalWrite = res.write.bind(res);
+        const originalEnd = res.end.bind(res);
+
+        res.write = function (chunk, ...args) {
+          if (chunk && req.targetOrigin) {
+            let data = chunk.toString();
+            // Add namespace to Socket.IO packets from server
+            const connectPattern = /^(4\d)(\/)(,.*)?$/;
+            if (connectPattern.test(data)) {
+              data = data.replace(connectPattern, `$1/${req.targetOrigin}$3`);
+              console.log(`🔧 Rewrote server→client packet: added namespace`);
+              chunk = Buffer.from(data);
+            }
+          }
+          return originalWrite(chunk, ...args);
+        };
+
+        res.end = function (chunk, ...args) {
+          if (chunk && req.targetOrigin) {
+            let data = chunk.toString();
+            const connectPattern = /^(4\d)(\/)(,.*)?$/;
+            if (connectPattern.test(data)) {
+              data = data.replace(connectPattern, `$1/${req.targetOrigin}$3`);
+              console.log(`🔧 Rewrote server→client packet: added namespace`);
+              chunk = Buffer.from(data);
+            }
+          }
+          return originalEnd(chunk, ...args);
+        };
+      },
+      error: (err) => {
+        console.error("Proxy error:", err);
+      },
+    },
+  });
+
+  proxy(req, res, next);
+});
 
 // Create HTTP server manually to handle WebSocket upgrade events
 const server = http.createServer(app);
 
-// Forward WebSocket upgrade events
-server.on("upgrade", wsProxy.upgrade);
+// WebSocket server for handling upgrades
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  console.log(`🔌 Upgrade request URL: ${req.url}`);
+
+  // Parse target from URL
+  const match = req.url.match(/^\/(https?:\/\/[^\/]+)(\/socket\.io.*)?$/);
+  if (!match) {
+    socket.destroy();
+    return;
+  }
+
+  const targetOrigin = match[1];
+  const targetPath = match[2] || "/socket.io";
+  const targetUrl = new URL(targetOrigin);
+
+  console.log(`📍 WebSocket target: ${targetOrigin}${targetPath}`);
+
+  wss.handleUpgrade(req, socket, head, (clientWs) => {
+    console.log(`✅ Client WebSocket established`);
+
+    // Emit connection event
+    wss.emit("connection", clientWs, req);
+
+    // Create WebSocket connection to target server
+    const targetWsUrl = `${targetUrl.protocol === "https:" ? "wss:" : "ws:"}//${targetUrl.host}${targetPath}`;
+    console.log(`➡️  Connecting to: ${targetWsUrl}`);
+
+    // Build headers object, only including defined values
+    const forwardHeaders = {};
+    if (req.headers.authorization) forwardHeaders.authorization = req.headers.authorization;
+    if (req.headers.source) forwardHeaders.source = req.headers.source;
+    if (req.headers["user-agent"]) forwardHeaders["user-agent"] = req.headers["user-agent"];
+
+    console.log(`📋 Forward headers:`, forwardHeaders);
+
+    const targetWs = new WebSocket(targetWsUrl, {
+      headers: forwardHeaders,
+      rejectUnauthorized: false,
+    });
+
+    targetWs.on("open", () => {
+      console.log(`✅ Connected to target server`);
+    });
+
+    targetWs.on("unexpected-response", (req, res) => {
+      console.error(`❌ Unexpected response from target: ${res.statusCode}`);
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => console.error(`Response body: ${body}`));
+      clientWs.close();
+    });
+
+    // Client → Server: Strip namespace from packets
+    clientWs.on("message", (data) => {
+      let message = data.toString();
+      const namespacePattern = /^(4\d)(\/https?:\/\/[^,]+)(,.*)?$/;
+
+      if (namespacePattern.test(message)) {
+        message = message.replace(namespacePattern, "$1/$3");
+        console.log(`🔧 Client→Server: ${data.toString()} → ${message}`);
+      } else {
+        console.log(`📤 Client→Server: ${message}`);
+      }
+
+      if (targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(message);
+      }
+    });
+
+    // Server → Client: Add namespace back to packets
+    targetWs.on("message", (data) => {
+      let message = data.toString();
+      const connectPattern = /^(4\d)(\/)(,.*)?$/;
+
+      if (connectPattern.test(message)) {
+        message = message.replace(connectPattern, `$1/${targetOrigin}$3`);
+        console.log(`🔧 Server→Client: ${data.toString()} → ${message}`);
+      } else {
+        console.log(`📥 Server→Client: ${message}`);
+      }
+
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(message);
+      }
+    });
+
+    clientWs.on("close", () => {
+      console.log(`❌ Client closed`);
+      targetWs.close();
+    });
+
+    targetWs.on("close", () => {
+      console.log(`❌ Target closed`);
+      clientWs.close();
+    });
+
+    clientWs.on("error", (err) => {
+      console.error(`Client error:`, err.message);
+      targetWs.close();
+    });
+
+    targetWs.on("error", (err) => {
+      console.error(`Target error:`, err.message);
+      clientWs.close();
+    });
+  });
+});
 
 server.listen(port, host, () => {
   console.log(`🚀 Proxy server running on http://${host}:${port}`);

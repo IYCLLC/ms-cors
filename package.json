@@ -12,7 +12,8 @@
   "dependencies": {
     "commander": "^14.0.0",
     "express": "^5.1.0",
-    "http-proxy-middleware": "^3.0.5"
+    "http-proxy-middleware": "^3.0.5",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/node": "^24.0.1",
