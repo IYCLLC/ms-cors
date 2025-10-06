@@ -3,6 +3,7 @@
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const { Command } = require("commander");
+const http = require("http");
 
 const program = new Command();
 
@@ -37,20 +38,16 @@ const cookieDomain = options.cookieDomain;
 
 const app = express();
 
-// Middleware to parse cors-anywhere style URLs
+// Parse cors-anywhere style URLs
 app.use("/", (req, res, next) => {
   const fullPath = req.url;
   const pathWithoutSlash = fullPath.substring(1);
   const targetMatch = pathWithoutSlash.match(/^(https?:\/\/[^\/]+)(\/.*)?$/);
-
   if (targetMatch) {
     const targetOrigin = targetMatch[1];
     const targetPath = targetMatch[2] || "/";
-
     req.targetOrigin = targetOrigin;
-    req.targetPath = targetPath;
     req.url = targetPath;
-
     next();
   } else {
     res.status(400).json({
@@ -60,23 +57,22 @@ app.use("/", (req, res, next) => {
   }
 });
 
-// Dynamic proxy middleware
-app.use("/", (req, res, next) => {
-  if (!req.targetOrigin) {
-    return next();
-  }
+// Dynamic proxy middleware with WebSocket support
+const dynamicProxy = (req, res, next) => {
+  if (!req.targetOrigin) return next();
 
   const proxy = createProxyMiddleware({
     target: req.targetOrigin,
     changeOrigin: true,
+    ws: true, // 🔥 Enable WebSocket forwarding
     secure: false,
     logLevel: "silent",
     on: {
-      proxyReq: (proxyReq, req, res) => {
+      proxyReq: (proxyReq, req) => {
         // Remove origin header so backend doesn't reject localhost
         proxyReq.removeHeader("origin");
       },
-      proxyRes: (proxyRes, req, res) => {
+      proxyRes: (proxyRes) => {
         // Override CORS headers
         proxyRes.headers["access-control-allow-origin"] = allowedOrigin;
         proxyRes.headers["access-control-allow-credentials"] = "true";
@@ -89,21 +85,62 @@ app.use("/", (req, res, next) => {
             (cookie) =>
               cookie
                 .replace(`Domain=${cookieDomain}`, "Domain=localhost")
-                .replace("Secure;", ""), // Remove Secure flag for HTTP localhost
+                .replace("Secure;", ""),
           );
         }
       },
       error: (err, req, res) => {
         console.error("Proxy error:", err);
-        res.status(500).json({ error: "Proxy error: " + err.message });
+        if (!res.headersSent)
+          res.status(500).json({ error: "Proxy error: " + err.message });
       },
     },
   });
 
   proxy(req, res, next);
+};
+
+const targetOrigin = "https://ws-dev.messagespring.com/";
+const WS_PATH = "/api/chat/socket.io";
+
+const wsProxy = createProxyMiddleware({
+  target: targetOrigin,
+  changeOrigin: true,
+  ws: true,
+  secure: true,
+  logLevel: "debug",
+
+  pathRewrite: (rawPath, req) => {
+
+    let path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+    // Remove proxy prefix (e.g. /https://ws-dev.messagespring.com)
+    path = path.replace(/^\/https?:\/\/[^/]+/, "");
+
+    // Normalize: make sure all WS routes end up under /api/chat/socket.io
+    if (path.startsWith(WS_PATH)) return path;
+    return path.replace(/^\/socket\.io/, WS_PATH);
+  },
+
+  // Helpful logs during WS upgrade
+  onProxyReqWs: (proxyReq, req, socket, options, head) => {
+    // @ts-ignore
+    const finalPath = proxyReq.path || req.url;
+    console.log(`➡️  WS → ${targetOrigin}${finalPath}`);
+  },
 });
 
-app.listen(port, host, () => {
-  console.log(`Proxy server running on http://${host}:${port}`);
+app.use(["/socket.io", "/api/chat/socket.io"], wsProxy);
+
+app.use("/", dynamicProxy);
+
+// Create HTTP server manually to handle WebSocket upgrade events
+const server = http.createServer(app);
+
+// Forward WebSocket upgrade events
+server.on("upgrade", wsProxy.upgrade);
+
+server.listen(port, host, () => {
+  console.log(`🚀 Proxy server running on http://${host}:${port}`);
   console.log(`Usage: http://${host}:${port}/http://target-host/path`);
+  console.log("Supports WebSocket forwarding ✅");
 });
