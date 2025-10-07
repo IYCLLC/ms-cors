@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 const express = require("express");
-const { createProxyMiddleware } = require("http-proxy-middleware");
 const { Command } = require("commander");
 const http = require("http");
 const WebSocket = require("ws");
@@ -67,49 +66,6 @@ app.use("/", (req, res, next) => {
     });
   }
 });
-
-// Dynamic proxy middleware with WebSocket support
-const dynamicProxy = (req, res, next) => {
-  if (!req.targetOrigin) return next();
-
-  const proxy = createProxyMiddleware({
-    target: req.targetOrigin,
-    changeOrigin: true,
-    ws: true, // 🔥 Enable WebSocket forwarding
-    secure: false,
-    logLevel: "silent",
-    on: {
-      proxyReq: (proxyReq, req) => {
-        // Remove origin header so backend doesn't reject localhost
-        proxyReq.removeHeader("origin");
-      },
-      proxyRes: (proxyRes) => {
-        // Override CORS headers
-        proxyRes.headers["access-control-allow-origin"] = allowedOrigin;
-        proxyRes.headers["access-control-allow-credentials"] = "true";
-        proxyRes.headers["access-control-allow-methods"] =
-          "GET, POST, PUT, PATCH, DELETE, OPTIONS";
-
-        // Fix cookie domain for localhost development
-        if (fixCookies && proxyRes.headers["set-cookie"]) {
-          proxyRes.headers["set-cookie"] = proxyRes.headers["set-cookie"].map(
-            (cookie) =>
-              cookie
-                .replace(`Domain=${cookieDomain}`, "Domain=localhost")
-                .replace("Secure;", ""),
-          );
-        }
-      },
-      error: (err, req, res) => {
-        console.error("Proxy error:", err);
-        if (!res.headersSent)
-          res.status(500).json({ error: "Proxy error: " + err.message });
-      },
-    },
-  });
-
-  proxy(req, res, next);
-};
 
 // Create HTTP server manually to handle WebSocket upgrade events
 const server = http.createServer(app);
