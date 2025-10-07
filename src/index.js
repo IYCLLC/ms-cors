@@ -39,16 +39,26 @@ const cookieDomain = options.cookieDomain;
 
 const app = express();
 
+// Parse cors-anywhere style URLs (format: /https://target.com/path)
+function parseCorsAnywhereUrl(url) {
+  const pathWithoutSlash = url.startsWith("/") ? url.substring(1) : url;
+  const match = pathWithoutSlash.match(/^(https?:\/\/[^\/]+)(\/.+)?$/);
+
+  if (match) {
+    return {
+      targetOrigin: match[1],
+      targetPath: match[2] || "/",
+    };
+  }
+  return null;
+}
+
 // Parse cors-anywhere style URLs
 app.use("/", (req, res, next) => {
-  const fullPath = req.url;
-  const pathWithoutSlash = fullPath.substring(1);
-  const targetMatch = pathWithoutSlash.match(/^(https?:\/\/[^\/]+)(\/.*)?$/);
-  if (targetMatch) {
-    const targetOrigin = targetMatch[1];
-    const targetPath = targetMatch[2] || "/";
-    req.targetOrigin = targetOrigin;
-    req.url = targetPath;
+  const parsed = parseCorsAnywhereUrl(req.url);
+  if (parsed) {
+    req.targetOrigin = parsed.targetOrigin;
+    req.url = parsed.targetPath;
     next();
   } else {
     res.status(400).json({
@@ -101,96 +111,6 @@ const dynamicProxy = (req, res, next) => {
   proxy(req, res, next);
 };
 
-// Middleware to parse cors-anywhere style URLs for Socket.IO
-app.use((req, res, next) => {
-  const match = req.url.match(/^\/(https?:\/\/[^\/]+)(\/socket\.io.*)?$/);
-  if (match) {
-    req.targetOrigin = match[1];
-    req.url = match[2] || "/socket.io";
-    console.log(`📍 Parsed target: ${req.targetOrigin}, path: ${req.url}`);
-  }
-  next();
-});
-
-// Dynamic WebSocket proxy
-app.use((req, res, next) => {
-  if (!req.targetOrigin) return next();
-
-  const proxy = createProxyMiddleware({
-    target: req.targetOrigin,
-    changeOrigin: true,
-    ws: true,
-    secure: false,
-    logLevel: "silent",
-
-    on: {
-      proxyReq: (proxyReq, req, res) => {
-        console.log(`➡️  HTTP → ${req.targetOrigin}${proxyReq.path}`);
-        proxyReq.removeHeader("origin");
-      },
-      proxyReqWs: (proxyReq, req, socket) => {
-        console.log(`➡️  WS → ${req.targetOrigin}${proxyReq.path}`);
-        proxyReq.removeHeader("origin");
-        proxyReq.removeHeader("referer");
-
-        // Intercept WebSocket frames to rewrite Socket.IO namespaces
-        const originalWrite = socket.write.bind(socket);
-        socket.write = function (data) {
-          if (typeof data === "string") {
-            // Rewrite namespace in Socket.IO CONNECT packets (e.g., "40/namespace,")
-            const namespacePattern = /^(4\d)(\/https?:\/\/[^,]+)(,.*)?$/;
-            if (namespacePattern.test(data)) {
-              data = data.replace(namespacePattern, "$1/$3");
-              console.log(`🔧 Rewrote client→server packet: stripped namespace`);
-            }
-          }
-          return originalWrite(data);
-        };
-      },
-      proxyRes: (proxyRes, req, res) => {
-        proxyRes.headers["access-control-allow-origin"] = allowedOrigin;
-        proxyRes.headers["access-control-allow-credentials"] = "true";
-
-        // Intercept server responses to add namespace back
-        const originalWrite = res.write.bind(res);
-        const originalEnd = res.end.bind(res);
-
-        res.write = function (chunk, ...args) {
-          if (chunk && req.targetOrigin) {
-            let data = chunk.toString();
-            // Add namespace to Socket.IO packets from server
-            const connectPattern = /^(4\d)(\/)(,.*)?$/;
-            if (connectPattern.test(data)) {
-              data = data.replace(connectPattern, `$1/${req.targetOrigin}$3`);
-              console.log(`🔧 Rewrote server→client packet: added namespace`);
-              chunk = Buffer.from(data);
-            }
-          }
-          return originalWrite(chunk, ...args);
-        };
-
-        res.end = function (chunk, ...args) {
-          if (chunk && req.targetOrigin) {
-            let data = chunk.toString();
-            const connectPattern = /^(4\d)(\/)(,.*)?$/;
-            if (connectPattern.test(data)) {
-              data = data.replace(connectPattern, `$1/${req.targetOrigin}$3`);
-              console.log(`🔧 Rewrote server→client packet: added namespace`);
-              chunk = Buffer.from(data);
-            }
-          }
-          return originalEnd(chunk, ...args);
-        };
-      },
-      error: (err) => {
-        console.error("Proxy error:", err);
-      },
-    },
-  });
-
-  proxy(req, res, next);
-});
-
 // Create HTTP server manually to handle WebSocket upgrade events
 const server = http.createServer(app);
 
@@ -200,15 +120,15 @@ const wss = new WebSocket.Server({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   console.log(`🔌 Upgrade request URL: ${req.url}`);
 
-  // Parse target from URL
-  const match = req.url.match(/^\/(https?:\/\/[^\/]+)(\/socket\.io.*)?$/);
-  if (!match) {
+  // Parse target from URL using shared parser
+  const parsed = parseCorsAnywhereUrl(req.url);
+  if (!parsed) {
+    console.error(`❌ Invalid URL format: ${req.url}`);
     socket.destroy();
     return;
   }
 
-  const targetOrigin = match[1];
-  const targetPath = match[2] || "/socket.io";
+  const { targetOrigin, targetPath } = parsed;
   const targetUrl = new URL(targetOrigin);
 
   console.log(`📍 WebSocket target: ${targetOrigin}${targetPath}`);
@@ -223,11 +143,13 @@ server.on("upgrade", (req, socket, head) => {
     const targetWsUrl = `${targetUrl.protocol === "https:" ? "wss:" : "ws:"}//${targetUrl.host}${targetPath}`;
     console.log(`➡️  Connecting to: ${targetWsUrl}`);
 
-    // Build headers object, only including defined values
     const forwardHeaders = {};
-    if (req.headers.authorization) forwardHeaders.authorization = req.headers.authorization;
-    if (req.headers.source) forwardHeaders.source = req.headers.source;
-    if (req.headers["user-agent"]) forwardHeaders["user-agent"] = req.headers["user-agent"];
+
+    // Forward cookies if present
+    if (req.headers.cookie) {
+      console.log('cookie', req.headers.cookie)
+      forwardHeaders.cookie = req.headers.cookie;
+    }
 
     console.log(`📋 Forward headers:`, forwardHeaders);
 
