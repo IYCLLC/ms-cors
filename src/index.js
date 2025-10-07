@@ -95,7 +95,7 @@ app.use("/", (req, res, next) => {
           proxyRes.headers["set-cookie"] = proxyRes.headers["set-cookie"].map(
             (cookie) =>
               cookie
-                .replace(`Domain=${cookieDomain}`, "Domain=localhost")
+                .replace(`Domain=${cookieDomain}`, "")
                 .replace("Secure;", ""), // Remove Secure flag for HTTP localhost
           );
         }
