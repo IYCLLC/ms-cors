@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const express = require("express");
+const { createProxyMiddleware } = require("http-proxy-middleware");
 const { Command } = require("commander");
 const http = require("http");
 const WebSocket = require("ws");
@@ -65,6 +66,48 @@ app.use("/", (req, res, next) => {
         "Invalid URL format. Use: http://localhost:8080/http://target-host/path",
     });
   }
+});
+
+app.use("/", (req, res, next) => {
+  if (!req.targetOrigin) {
+    return next();
+  }
+
+  const proxy = createProxyMiddleware({
+    target: req.targetOrigin,
+    changeOrigin: true,
+    secure: false,
+    logLevel: "silent",
+    on: {
+      proxyReq: (proxyReq, req, res) => {
+        // Remove origin header so backend doesn't reject localhost
+        proxyReq.removeHeader("origin");
+      },
+      proxyRes: (proxyRes, req, res) => {
+        // Override CORS headers
+        proxyRes.headers["access-control-allow-origin"] = allowedOrigin;
+        proxyRes.headers["access-control-allow-credentials"] = "true";
+        proxyRes.headers["access-control-allow-methods"] =
+          "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+
+        // Fix cookie domain for localhost development
+        if (fixCookies && proxyRes.headers["set-cookie"]) {
+          proxyRes.headers["set-cookie"] = proxyRes.headers["set-cookie"].map(
+            (cookie) =>
+              cookie
+                .replace(`Domain=${cookieDomain}`, "Domain=localhost")
+                .replace("Secure;", ""), // Remove Secure flag for HTTP localhost
+          );
+        }
+      },
+      error: (err, req, res) => {
+        console.error("Proxy error:", err);
+        res.status(500).json({ error: "Proxy error: " + err.message });
+      },
+    },
+  });
+
+  proxy(req, res, next);
 });
 
 // Create HTTP server manually to handle WebSocket upgrade events
