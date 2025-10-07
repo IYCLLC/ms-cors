@@ -3,6 +3,8 @@
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const { Command } = require("commander");
+const http = require("http");
+const WebSocket = require("ws");
 
 const program = new Command();
 
@@ -37,20 +39,26 @@ const cookieDomain = options.cookieDomain;
 
 const app = express();
 
-// Middleware to parse cors-anywhere style URLs
+// Parse cors-anywhere style URLs (format: /https://target.com/path)
+function parseCorsAnywhereUrl(url) {
+  const pathWithoutSlash = url.startsWith("/") ? url.substring(1) : url;
+  const match = pathWithoutSlash.match(/^(https?:\/\/[^\/]+)(\/.+)?$/);
+
+  if (match) {
+    return {
+      targetOrigin: match[1],
+      targetPath: match[2] || "/",
+    };
+  }
+  return null;
+}
+
+// Parse cors-anywhere style URLs
 app.use("/", (req, res, next) => {
-  const fullPath = req.url;
-  const pathWithoutSlash = fullPath.substring(1);
-  const targetMatch = pathWithoutSlash.match(/^(https?:\/\/[^\/]+)(\/.*)?$/);
-
-  if (targetMatch) {
-    const targetOrigin = targetMatch[1];
-    const targetPath = targetMatch[2] || "/";
-
-    req.targetOrigin = targetOrigin;
-    req.targetPath = targetPath;
-    req.url = targetPath;
-
+  const parsed = parseCorsAnywhereUrl(req.url);
+  if (parsed) {
+    req.targetOrigin = parsed.targetOrigin;
+    req.url = parsed.targetPath;
     next();
   } else {
     res.status(400).json({
@@ -60,7 +68,6 @@ app.use("/", (req, res, next) => {
   }
 });
 
-// Dynamic proxy middleware
 app.use("/", (req, res, next) => {
   if (!req.targetOrigin) {
     return next();
@@ -103,7 +110,123 @@ app.use("/", (req, res, next) => {
   proxy(req, res, next);
 });
 
-app.listen(port, host, () => {
-  console.log(`Proxy server running on http://${host}:${port}`);
+// Create HTTP server manually to handle WebSocket upgrade events
+const server = http.createServer(app);
+
+// WebSocket server for handling upgrades
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  console.log(`🔌 Upgrade request URL: ${req.url}`);
+
+  // Parse target from URL using shared parser
+  const parsed = parseCorsAnywhereUrl(req.url);
+  if (!parsed) {
+    console.error(`❌ Invalid URL format: ${req.url}`);
+    socket.destroy();
+    return;
+  }
+
+  const { targetOrigin, targetPath } = parsed;
+  const targetUrl = new URL(targetOrigin);
+
+  console.log(`📍 WebSocket target: ${targetOrigin}${targetPath}`);
+
+  wss.handleUpgrade(req, socket, head, (clientWs) => {
+    console.log(`✅ Client WebSocket established`);
+
+    // Emit connection event
+    wss.emit("connection", clientWs, req);
+
+    // Create WebSocket connection to target server
+    const targetWsUrl = `${targetUrl.protocol === "https:" ? "wss:" : "ws:"}//${targetUrl.host}${targetPath}`;
+    console.log(`➡️  Connecting to: ${targetWsUrl}`);
+
+    const forwardHeaders = {};
+
+    // Forward cookies if present
+    if (req.headers.cookie) {
+      console.log('cookie', req.headers.cookie)
+      forwardHeaders.cookie = req.headers.cookie;
+    }
+
+    console.log(`📋 Forward headers:`, forwardHeaders);
+
+    const targetWs = new WebSocket(targetWsUrl, {
+      headers: forwardHeaders,
+      rejectUnauthorized: false,
+    });
+
+    targetWs.on("open", () => {
+      console.log(`✅ Connected to target server`);
+    });
+
+    targetWs.on("unexpected-response", (req, res) => {
+      console.error(`❌ Unexpected response from target: ${res.statusCode}`);
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => console.error(`Response body: ${body}`));
+      clientWs.close();
+    });
+
+    // Client → Server: Strip namespace from packets
+    clientWs.on("message", (data) => {
+      let message = data.toString();
+      const namespacePattern = /^(4\d)(\/https?:\/\/[^,]+)(,.*)?$/;
+
+      if (namespacePattern.test(message)) {
+        message = message.replace(namespacePattern, "$1/$3");
+        console.log(`🔧 Client→Server: ${data.toString()} → ${message}`);
+      } else {
+        console.log(`📤 Client→Server: ${message}`);
+      }
+
+      if (targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(message);
+      }
+    });
+
+    // Server → Client: Add namespace back to packets
+    targetWs.on("message", (data) => {
+      let message = data.toString();
+      const connectPattern = /^(4\d)(\/)(,.*)?$/;
+
+      if (connectPattern.test(message)) {
+        message = message.replace(connectPattern, `$1/${targetOrigin}$3`);
+        console.log(`🔧 Server→Client: ${data.toString()} → ${message}`);
+      } else {
+        console.log(`📥 Server→Client: ${message}`);
+      }
+
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(message);
+      }
+    });
+
+    clientWs.on("close", () => {
+      console.log(`❌ Client closed`);
+      targetWs.close();
+    });
+
+    targetWs.on("close", () => {
+      console.log(`❌ Target closed`);
+      clientWs.close();
+    });
+
+    clientWs.on("error", (err) => {
+      console.error(`Client error:`, err.message);
+      targetWs.close();
+    });
+
+    targetWs.on("error", (err) => {
+      console.error(`Target error:`, err.message);
+      clientWs.close();
+    });
+  });
+});
+
+server.listen(port, host, () => {
+  console.log(`🚀 Proxy server running on http://${host}:${port}`);
   console.log(`Usage: http://${host}:${port}/http://target-host/path`);
+  console.log("Supports WebSocket forwarding ✅");
 });
